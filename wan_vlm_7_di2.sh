@@ -1,0 +1,1 @@
+CUDA_VISIBLE_DEVICES=4,5,6,7 torchrun --nproc_per_node=4 --master_port=29100 train/train_wan_vlm_14.py --deepspeed configs/zero1.json --config configs/robotwin_wan_vlm_7.yaml

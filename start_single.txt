@@ -1,0 +1,83 @@
+#!/bin/bash
+
+env
+__conda_setup="$('/root/miniconda3/bin/conda' 'shell.bash' 'hook' 2> /dev/null)"
+if [ $? -eq 0 ]; then
+    eval "$__conda_setup"
+else
+    if [ -f "/root/miniconda3/etc/profile.d/conda.sh" ]; then
+        . "/root/miniconda3/etc/profile.d/conda.sh"
+    else
+        export PATH="/root/miniconda3/bin:$PATH"
+    fi
+fi
+unset __conda_setup
+
+conda activate qwen3
+
+echo "--------------Sh Start------------------"
+
+USE_JUICEFS=0
+
+export TORCH_NCCL_DUMP_ON_TIMEOUT=1
+export TORCH_NCCL_TRACE_BUFFER_SIZE=2000
+
+
+function safe_mkdir() {
+    if [ ! -d $1 ]; then
+    mkdir $1
+    fi
+}
+function safe_multi_mkdir() {
+    if [ ! -d $1 ]; then
+        mkdir -p $1
+    fi
+}
+export S3_ENDPOINT="https://obs.cn-southwest-2.myhuaweicloud.com"
+export S3_USE_HTTPS="0"
+export ACCESS_KEY_ID="HPUACJ8EWHNONWBP1PGQ"
+export SECRET_ACCESS_KEY="rx3ITEWElWS8dZnPHmFMmMiiGkQ2pk5FguQ0d1QN"
+
+
+OBSDIR="obs://yw-2030-gy/external/wwx1484778"
+
+echo "--------------copy code------------------"
+CODEDIR=$OBSDIR/Our
+if [ ! -d '/cache/motus_codes' ]; then
+    safe_multi_mkdir /cache/motus_codes
+fi
+CODENAME="Motus"
+if [ ! -d "/cache/motus_codes/$CODENAME" ]; then
+    python -c "import moxing as mox; mox.file.copy_parallel('$CODEDIR/$CODENAME', '/cache/motus_codes/$CODENAME')"
+fi
+
+echo "--------------copy code done------------------"
+
+cd /cache/motus_codes/$CODENAME
+
+echo "--------------Download obs weights!!!--------------"
+python download_from_obs.py
+echo "--------------Download obs weights Done!!!--------------"
+
+echo "--------------copy train datasets------------------"
+DATASETDIR=obs://yw-2030-gy/data/opensource/RoboTwin2_0/RoboTwin_emb
+if [ ! -d '/cache/wwx1484778/RoboTwin_emb' ]; then
+  safe_multi_mkdir /cache/wwx1484778/RoboTwin_emb
+  python -c "import moxing as mox; mox.file.copy_parallel('$DATASETDIR', '/cache/wwx1484778/RoboTwin_emb')"
+fi
+echo "--------------copy train datasets done------------------"
+
+echo "--------------set envs------------------"
+envs_name=motus
+python -c "import moxing as mox; mox.file.copy_parallel('$OBSDIR/envs/$envs_name.tar.gz','/cache/envs/$envs_name.tar.gz')"
+mkdir -p /root/miniconda3/envs/$envs_name
+tar -xf /cache/envs/$envs_name.tar.gz -C /root/miniconda3/envs
+conda activate $envs_name
+echo "--------------set envs done------------------"
+
+echo "--------------Train Start !!!--------------"
+bash motus_di1_8gpus_stage2.sh
+echo "--------------Train End !!!--------------"
+conda activate qwen3
+echo "--------------Upload weights and log to OBS!!!--------------"
+python upload_checkpoint_to_obs.py

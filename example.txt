@@ -1,0 +1,241 @@
+#!/bin/bash
+set -e
+
+env
+__conda_setup="$('/root/miniconda3/bin/conda' 'shell.bash' 'hook' 2> /dev/null)"
+if [ $? -eq 0 ]; then
+    eval "$__conda_setup"
+else
+    if [ -f "/root/miniconda3/etc/profile.d/conda.sh" ]; then
+        . "/root/miniconda3/etc/profile.d/conda.sh"
+    else
+        export PATH="/root/miniconda3/bin:$PATH"
+    fi
+fi
+unset __conda_setup
+
+conda activate qwen3
+pip install redis
+python -c "import moxing as mox;mox.file.copy('obs://yw-ads-training-gy1/data/external/personal/s00680134/dataset_index/pkgs/moxing_framework-2.3.11-py2.py3-none-any.whl', '/cache/moxing_framework-2.3.11-py2.py3-none-any.whl')" 
+pip install /cache/moxing_framework-2.3.11-py2.py3-none-any.whl
+export JUICEFS=1
+export TORCH_NCCL_DUMP_ON_TIMEOUT=1
+export TORCH_NCCL_TRACE_BUFFER_SIZE=2000
+
+function safe_mkdir() {
+  if [ ! -d $1 ]; then
+    mkdir $1
+  fi
+}
+function safe_multi_mkdir() {
+  if [ ! -d $1 ]; then
+    mkdir -p $1
+  fi
+}
+
+# 设置 OBS/S3 兼容接口的环境变量
+export S3_ENDPOINT="https://obs.cn-southwest-2.myhuaweicloud.com"
+export S3_USE_HTTPS="0"
+export ACCESS_KEY_ID="HPUACJ8EWHNONWBP1PGQ"
+export SECRET_ACCESS_KEY="rx3ITEWElWS8dZnPHmFMmMiiGkQ2pk5FguQ0d1QN"
+echo "--------------init done------------------"
+
+OBSDIR="obs://yw-2030-gy/external/c30079694" 
+echo "--------------copy code------------------"
+CODEDIR=$OBSDIR/codes/proj1
+if [ ! -d '/cache/codes' ]; then
+  safe_multi_mkdir /cache/codes
+fi
+
+CODENAME="VoT4AD"
+if [ ! -d "/cache/codes/$CODENAME" ]; then
+    python -c "import moxing as mox; mox.file.copy_parallel('$CODEDIR/$CODENAME', '/cache/codes/$CODENAME')"
+fi
+CODEPATH=$CODEDIR/$CODENAME
+echo "--------------copy code done------------------"
+
+cd /cache/codes/$CODENAME
+
+echo "--------------copy whls ------------------"
+python -c "import moxing as mox; mox.file.copy_parallel('obs://yw-2030-gy/external/c30079694/whls/', '/cache/whls')"
+echo "--------------copy code done------------------"
+
+echo "--------------copy pretrained model------------------"
+PRETRAINEDDIR=$OBSDIR/pretrained_models
+if [ ! -d '/cache/c30079694/pretrained_models' ]; then
+  safe_multi_mkdir /cache/c30079694/pretrained_models
+fi
+
+MODELNAME=Qwen2.5-VL-3B-Instruct-BEV-Feature-Token-1024
+if [ ! -d "/cache/c30079694/pretrained_models/$MODELNAME" ]; then
+    python -c "import moxing as mox; mox.file.copy_parallel('$PRETRAINEDDIR/$MODELNAME', '/cache/c30079694/pretrained_models/$MODELNAME')"
+fi
+
+echo "--------------copy pretrained model done------------------"
+
+echo "--------------set outputs------------------"
+OUTPUTDIR=$OBSDIR/outputs/vot4ad
+if [ ! -d '/cache/c30079694/outputs/vot4ad' ]; then
+  safe_multi_mkdir /cache/c30079694/outputs/vot4ad
+fi
+
+if [ ! -d "/cache/c30079694/outputs/vot4ad/$PRETRAIN_MODEL_NAME/qwen2.5-vl-final-ckpt" ]; then
+    python -c "import moxing as mox; mox.file.copy_parallel('$OUTPUTDIR/$PRETRAIN_MODEL_NAME/qwen2.5-vl-final-ckpt', '/cache/c30079694/outputs/vot4ad/$PRETRAIN_MODEL_NAME/qwen2.5-vl-final-ckpt')"
+fi
+echo "--------------set outputs done------------------"
+
+echo "--------------copy train datasets------------------"
+DATASETDIR=$OBSDIR/cache_proj/proj_1
+if [ ! -d '/cache/c30079694/cache_proj/proj_1' ]; then
+  safe_multi_mkdir /cache/c30079694/cache_proj/proj_1
+fi
+
+DATANAME=navsim4qwenvl-vq
+if [ ! -d "/cache/c30079694/cache_proj/proj_1/$DATANAME" ]; then
+    echo "download $DATANAME"
+    python -c "import moxing as mox; mox.file.copy_parallel('$DATASETDIR/$DATANAME', '/cache/c30079694/cache_proj/proj_1/$DATANAME')"
+fi
+echo "--------------copy train datasets done------------------"
+
+echo "--------------set envs------------------"
+envs_name=czs-qwen3vl-easyr1
+python -c "import moxing as mox; mox.file.copy_parallel('$OBSDIR/envs/$envs_name.tar.gz','/cache/envs/$envs_name.tar.gz')"
+mkdir -p /root/miniconda3/envs/$envs_name
+tar -xf /cache/envs/$envs_name.tar.gz -C /root/miniconda3/envs/$envs_name
+conda activate $envs_name
+
+python -c "import moxing as mox;mox.file.copy('obs://yw-ads-training-gy1/data/external/personal/s00680134/dataset_index/pkgs/moxing_framework-2.3.11-py2.py3-none-any.whl', '/cache/moxing_framework-2.3.11-py2.py3-none-any.whl')" 
+pip install redis
+pip install /cache/moxing_framework-2.3.11-py2.py3-none-any.whl
+export JUICEFS=1
+
+cd /cache/codes/$CODENAME/RL4AD/EasyR1
+pip install -q -e .
+cd /cache/codes/$CODENAME/RL4AD/navsim_v1.1.0
+pip install -q -e .
+echo "--------------set envs done------------------"
+
+echo "--------------Training--------------"
+export NUPLAN_MAP_VERSION="nuplan-maps-v1.2"
+export NUPLAN_MAPS_ROOT="obs://yw-2030-gy/external/c30079694/datasets/navsim_dataset/maps"
+export NAVSIM_EXP_ROOT="obs://yw-2030-gy/external/c30079694/datasets/navsim_dataset/exp"
+export OPENSCENE_DATA_ROOT="obs://yw-2030-gy/external/c30079694/datasets/navsim_dataset"
+export TENSORBOARD_DIR="/cache/c30079694/output/easryr1/tensorboard_log"
+
+export OBSPATH="obs://yw-2030-gy/external/c30079694/outputs/vot4ad/$OBSNAME"
+
+export TMP_DIR="/cache/tmp"
+
+export TOKENIZERS_PARALLELISM="false"
+export VLLM_WORKER_MULTIPROC_METHOD="spawn"
+
+export GLOO_SOCKET_IFNAME=bond0
+# export NCCL_SOCKET_IFNAME=bond0
+
+# 参数设置（可以改成从环境变量读取）
+TOTAL_NODES=$WORLD_SIZE       # 总节点数
+GPU_PER_NODE=8               # 每台机器的 GPU 数量
+RAY_HEAD_IP="${MASTER_ADDR}"  # 主节点 IP
+# RAY_HEAD_IP="$(hostname -I | awk '{print $1}')"  # 主节点 IP
+RAY_PORT="${MASTER_PORT}"              # Ray 默认端口
+NODE_RANK="${RANK}"          # 当前节点 rank（0 是主节点）
+export RAY_ADDRESS="$RAY_HEAD_IP:$RAY_PORT"
+
+echo "RAY_HEAD_IP: $RAY_HEAD_IP"
+echo "NODE_RANK: $NODE_RANK"
+echo "TOTAL_NODES: $TOTAL_NODES"
+echo "GPU_PER_NODE: $GPU_PER_NODE"
+echo "RAY_PORT: $RAY_PORT"
+
+echo "TENSORBOARD_DIR: $TENSORBOARD_DIR"
+echo "NUPLAN_MAP_VERSION: $NUPLAN_MAP_VERSION"
+echo "NUPLAN_MAPS_ROOT: $NUPLAN_MAPS_ROOT"
+echo "NAVSIM_EXP_ROOT: $NAVSIM_EXP_ROOT"
+echo "OPENSCENE_DATA_ROOT: $OPENSCENE_DATA_ROOT"
+
+echo "OBSPATH: $OBSPATH"
+
+
+# 检查是否是主节点
+if [ "$NODE_RANK" -eq 0 ]; then
+    echo "Starting Ray HEAD node on $(hostname -I | awk '{print $1}')"
+    ray start --head --port="$RAY_PORT" --dashboard-host=0.0.0.0 --num-gpus="$GPU_PER_NODE" --temp-dir $TMP_DIR || true
+    python3 -c "import time; time.sleep(20)"
+else
+    python3 -c "import time; time.sleep(10)"
+    echo "Starting Ray WORKER node #$NODE_RANK, connecting to $RAY_HEAD_IP:$RAY_PORT"
+    ray start --address=$RAY_ADDRESS --num-gpus="$GPU_PER_NODE" --block || true
+fi
+
+# 等待所有节点加入（主节点检查）
+if [ "$NODE_RANK" -eq 0 ]; then
+    echo "Waiting for all nodes to join..."
+    while true; do
+        echo "Checking connected nodes..."
+        LIVE_NODES=$(ray status | grep -c " 1 node_")
+        echo "Current connected nodes: $LIVE_NODES / $TOTAL_NODES"
+        
+        # 打印ray status的完整输出以便调试
+        echo "Ray cluster status:"
+        ray status
+        
+        if [ "$LIVE_NODES" -eq "$TOTAL_NODES" ]; then
+            echo "All $TOTAL_NODES nodes connected successfully!"
+        echo "Waiting 20 seconds before break..."
+        python3 -c "import time; time.sleep(20)"
+            break
+        fi
+        echo "Waiting 20 seconds before next check..."
+        python3 -c "import time; time.sleep(20)"
+    done
+
+    # 在主节点上启动训练脚本
+    echo "Launching training script..."
+    echo "Setting up SwanLab environment variables..."
+    echo "Starting training..."
+    cd /cache/codes/$CODENAME/RL4AD/EasyR1
+    python3 -m verl.trainer.main \
+        config=/cache/codes/$CODENAME/RL4AD/EasyR1/examples/config.yaml \
+        data.prompt_key=prompt \
+        data.filter_overlong_prompts=false \
+        data.max_pixels=301056 \
+        data.train_files=/cache/c30079694/cache_proj/proj_1/navsim4qwenvl-vq/annotations/easyr1_files/refl_v6/refl_navtrain_1-8v_traj_8pts_coarse_bev_tag_25k_NEW_v2.jsonl \
+        data.val_files=/cache/c30079694/cache_proj/proj_1/navsim4qwenvl-vq/annotations/easyr1_files/refl_v6/refl_navtest_1-8v_traj_8pts_coarse_bev_1k.jsonl \
+        data.rollout_batch_size=256 \
+        data.mini_rollout_batch_size=64 \
+        worker.rollout.n=8 \
+        data.val_batch_size=256 \
+        worker.actor.global_batch_size=128 \
+        worker.actor.micro_batch_size_per_device_for_update=4 \
+        worker.actor.micro_batch_size_per_device_for_experience=8 \
+        worker.actor.model.model_path=/cache/c30079694/outputs/vot4ad/$PRETRAIN_MODEL_NAME/qwen2.5-vl-final-ckpt \
+        worker.actor.optim.lr_scheduler_type=cosine \
+        worker.actor.optim.lr=2.0e-6 \
+        worker.actor.optim.lr_warmup_steps=20 \
+        worker.actor.optim.min_lr_ratio=0.02 \
+        worker.rollout.limit_images=8 \
+        worker.rollout.tensor_parallel_size=1 \
+        worker.reward.reward_function=/cache/codes/$CODENAME/RL4AD/EasyR1/examples/reward_function/pdms_bev.py:NAVSIMReward \
+        worker.reward.reward_function_kwargs.reward_type=$reward_type \
+        worker.reward.reward_function_kwargs.oob_scale=1.2 \
+        worker.reward.reward_function_kwargs.HIGH_SCORE_THRESHOLD=0.92 \
+        worker.reward.reward_function_kwargs.format_weight=0.1 \
+        worker.reward.reward_function_kwargs.len_weight=0.1 \
+        worker.reward.reward_function_kwargs.refl_weight=0.25 \
+        trainer.project_name=NAVSIM_RL \
+        trainer.experiment_name=Reward \
+        trainer.n_gpus_per_node=$GPU_PER_NODE \
+        trainer.save_checkpoint_path=/cache/c30079694/output/easyr1 \
+        trainer.total_epochs=5 \
+        trainer.val_freq=20 \
+        trainer.save_freq=20 \
+        trainer.nnodes=$TOTAL_NODES \
+        trainer.n_gpus_per_node=$GPU_PER_NODE \
+        algorithm.online_filtering=True \
+        worker.actor.clip_ratio_low=3e-4 \
+        worker.actor.clip_ratio_high=4e-4 \
+        worker.actor.loss_type=gspo_token \
+        worker.actor.loss_avg_mode=seq \
+        algorithm.disable_kl=True \
+
+fi

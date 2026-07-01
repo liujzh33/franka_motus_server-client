@@ -1,0 +1,1 @@
+torchrun --nproc_per_node=8 --master_port=28100 train/train.py --deepspeed configs/zero1.json --config configs/robotwin.yaml
