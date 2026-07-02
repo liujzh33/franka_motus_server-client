@@ -2,3 +2,276 @@ CUDA_VISIBLE_DEVICES=4,5,6,7 torchrun --nproc_per_node=4 --master_port=28102 \
       train/train_wan_vlm_mask_franka.py \                                                                                                                                                     
       --deepspeed configs/zero1.json \                                                                                                                                                         
       --config configs/robotwin_wan_vlm_mask_stage2_franka.yaml 
+● 下面给出对这套训练 / 推理流程的完整梳理。所有结论都来自对你仓库里 configs/robotwin_wan_vlm_mask_stage2_franka.yaml、data/lerobot/lerobot_dataset.py、train/train_wan_vlm_mask_franka.py、util
+  s/vlm_utils.py、inference/real_world/Motus/server_vlm_mask.py、client.py 以及 franka_data/ 目录的实际阅读。
+  
+  ---
+  1. Franka 数据是什么格式
+
+  使用的是 LeRobot v3.0 格式（info.json 里 "codebase_version": "v3.0"），多任务 (task_mode: multi)，目录结构如下：
+
+  franka_data/
+  ├── place_objects_into_the_box_rc_0524/
+  │   ├── data/chunk-000/file-XXX.parquet        # 每帧的 state/actions/frame_index/episode_index/timestamp/task_index
+  │   ├── videos/
+  │   │   ├── global_image/chunk-000/file-XXX.mp4   # 第三方视角，480×640, av1, 30fps
+  │   │   ├── wrist_image/chunk-000/file-XXX.mp4    # 左手腕相机
+  │   │   └── right_image/chunk-000/file-XXX.mp4    # 右手腕相机
+  │   ├── meta/
+  │   │   ├── info.json          # features / 维度 / fps
+  │   │   ├── stats.json         # action / state 的 min,max,mean,std（归一化用）
+  │   │   ├── tasks.parquet
+  │   │   └── episodes/chunk-000/file-000.parquet  # 每个 episode 的 task 文本
+  │   └── t5_embedding/episode_XXXXXX.pt          # 预计算好的 WAN T5 文本 embedding
+  └── stack_bowls_rc/   （结构同上）
+
+  关键字段（来自 info.json）：
+
+  ┌──────────────────────────────────────────────────────┬───────────────────┬───────────────────────────────┐
+  │                         字段                         │       shape       │             说明              │
+  ├──────────────────────────────────────────────────────┼───────────────────┼───────────────────────────────┤
+  │ global_image                                         │ [480,640,3] video │ 第三方相机（被当作 cam_high） │
+  ├──────────────────────────────────────────────────────┼───────────────────┼───────────────────────────────┤
+  │ wrist_image                                          │ [480,640,3] video │ 被当作 cam_left_wrist         │
+  ├──────────────────────────────────────────────────────┼───────────────────┼───────────────────────────────┤
+  │ right_image                                          │ [480,640,3] video │ 被当作 cam_right_wrist        │
+  ├──────────────────────────────────────────────────────┼───────────────────┼───────────────────────────────┤
+  │ state                                                │ [7] float32       │ Franka 7-DOF qpos             │
+  ├──────────────────────────────────────────────────────┼───────────────────┼───────────────────────────────┤
+  │ actions                                              │ [7] float32       │ 7-DOF action                  │
+  ├──────────────────────────────────────────────────────┼───────────────────┼───────────────────────────────┤
+  │ frame_index / episode_index / timestamp / task_index │ [1]               │ 索引                          │
+  └──────────────────────────────────────────────────────┴───────────────────┴───────────────────────────────┘
+
+  stats.json 里 action 和 state 都有 min/max/mean/std/count，在 dataset 里通过 load_normalization_stats(..., embodiment_type="franka") 读取，把 action 和 state 归一化到 [0,1]。
+
+  T5 embedding：precompute_franka_t5.py 会读取每个 episode 的 tasks 字段（任务文本字符串），用 WAN 自带的 umt5-xxl 编码到 [1, 512, D]，存为 t5_embedding/episode_XXXXXX.pt，训练时按
+  episode_index 直接加载，避免在线编码。
+
+  ---
+  2. 训练时 Franka 数据具体怎么用
+
+  2.1 数据加载链路
+
+  train_wan_vlm_mask_franka.py → data/dataset.py:create_dataset → dataset.type=="lerobot" 分支 → data/lerobot/lerobot_dataset.py:LeRobotMotusDataset。
+
+  config 里关键映射（这是 Franka 专属的，因为 Franka 用的是非标准 key）：
+
+  params:
+    embodiment_type: "franka"
+    cam_high_key: "global_image"        # 用 global_image 顶替 cam_high
+    cam_left_wrist_key: "wrist_image"   # 用 wrist_image 顶替 cam_left_wrist
+    cam_right_wrist_key: "right_image"  # 用 right_image 顶替 cam_right_wrist
+    enable_t5_fallback: true
+    t5_wan_path: "/home/ma-user/work/wx1513998/pretrained_models"
+    t5_folder_name: "t5_embedding"
+    t5_text_len: 512
+
+  LeRobotMotusDataset.__init__ 在 cam_high_key 不为 None 时进入 has_three_cam=True 分支（has_concat=False），表示走"三相机拼接"路径。
+
+  2.2 采样索引（一个 sample 的来源）
+
+  _calculate_sampling_indices：
+  - action_chunk_size = num_video_frames * video_action_freq_ratio = 8 * 2 = 16
+  - physical_chunk_size = action_chunk_size * global_downsample_rate = 16 * 3 = 48 帧
+  - 在 episode 内随机取一个 condition_frame_idx（条件帧 = first_frame，对应 initial_state）
+  - action_indices = [cond + (i+1)*3 for i in range(16)] → 16 个 action（间隔 3 帧，覆盖 ~48 帧 ≈ 1.6s @30fps）
+  - video_indices = [action_indices[(i+1)*2 - 1] for i in range(8)] → 8 个视频帧（在 action 序列里每 2 个取 1 个）
+
+  2.3 图片是怎么拼接的（重点）
+
+  __getitem__ 里 has_three_cam 分支（lerobot_dataset.py 第 730-745 行附近）：
+
+  frames_high  = _decode_key("global_image")    # [T,C,H,W]
+  frames_left  = _decode_key("wrist_image")
+  frames_right = _decode_key("right_image")
+  stitched = []
+  for i in range(frames_high.shape[0]):
+      stitched.append(load_concatenated_view({
+          "observation.images.cam_high": frames_high[i],
+          "observation.images.cam_left_wrist": frames_left[i],
+          "observation.images.cam_right": frames_right[i],
+      }))
+  first_frame = stitched[0]
+  video_frames_sampled = torch.stack(stitched[1:], dim=0)
+
+  load_concatenated_view（lerobot_dataset.py 第 610-649 行）做的就是把三张图拼成 T 字形：
+
+  ┌───────────────────────┐
+  │                       │
+  │      global_image     │   top  高 = top_h,  宽 = target_w
+  │      (cam_high)       │
+  │                       │
+  ├───────────┬───────────┤
+  │  wrist    │   right   │   bottom 高 = top_h//2
+  │  (left)   │  (right)  │   左半宽 = target_w//2, 右半宽 = target_w - target_w2
+  └───────────┴───────────┘
+
+  然后 _resize_frame_chw(..., (video_height, video_width) = (384, 320)) 用 resize_with_padding 缩放到 384×320。
+
+  所以模型实际看到的"一帧"是 global 在上、wrist/right 在下并排的拼接图，分辨率 384×320。first_frame（条件帧，也是给 VLM 看的图）和 video_frames（8 帧未来视频）用的都是这种拼接图。
+
+  2.4 state / action
+
+  initial_state = item_cond["state"]            # [7]
+  action_sequence = hf_dataset[action_indices]["actions"]  # [16, 7]
+  normalized_actions = normalize_actions(action_sequence, action_min, action_max)        # [0,1]
+  normalized_initial_state = normalize_actions(initial_state, action_min, action_max)    # [0,1]
+
+  即用 stats.json 的 min/max 把 7 维 state 和 16×7 的 action 都归一化到 [0,1]。
+
+  2.5 prompt / 文本怎么输入（两条文本通路）
+
+  模型同时使用 WAN T5 和 Qwen3-VL-2B 两个文本条件，输入是同一条任务指令（来自 episode 的 task 文本，例如 "place objects into the box" 之类）：
+
+  (a) WAN T5 路径（language_embedding）
+  - 优先从 t5_embedding/episode_XXXXXX.pt 加载（precompute_franka_t5.py 预计算好的，shape 一般是 [1, 512, D]）
+  - 若没找到且 enable_t5_fallback=True，则用 WAN 的 T5EncoderModel 在线编码任务文本并缓存 
+  - batch 里通过 collate_fn 的 _process_language_embeddings_batch pad 到 [B, 512, D]
+
+  (b) Qwen3-VL 路径（vlm_inputs）（utils/vlm_utils.py:preprocess_vlm_messages）
+  - 取 first_frame（拼接好的 T 字形图）转 PIL
+  - 构造 Qwen3-VL chat 消息：
+  messages = [{"role":"user",
+               "content":[{"type":"image","image":first_frame_pil},
+                          {"type":"text","text":task_instruction}]}]
+  text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+  image_inputs, _ = process_vision_info(messages)
+  inputs = processor(text=[text], images=image_inputs, videos=None,
+                     padding=True, return_tensors="pt")
+  # → input_ids / attention_mask / pixel_values / image_grid_thw
+  - 即 VLM 看到的是 拼接图 + 任务文本，文本在图之后（顺序与训练完全一致，推理服务器里也保持一致）。
+
+  2.6 一个训练 batch 的字段
+
+  collate_fn 产出的 batch 包含（franka 配置下 subtask/progress 关闭，所以这些为 None）：
+
+  ┌────────────────────┬─────────────────┬──────────────────────────────────────────────────────────────────┐
+  │        key         │      shape      │                               含义                               │
+  ├────────────────────┼─────────────────┼──────────────────────────────────────────────────────────────────┤
+  │ first_frame        │ [B,3,384,320]   │ 拼接条件帧，[0,1]                                                │
+  ├────────────────────┼─────────────────┼──────────────────────────────────────────────────────────────────┤
+  │ video_frames       │ [B,8,3,384,320] │ 未来 8 帧拼接图，[0,1]                                           │
+  ├────────────────────┼─────────────────┼──────────────────────────────────────────────────────────────────┤
+  │ initial_state      │ [B,7]           │ 归一化 qpos                                                      │
+  ├────────────────────┼─────────────────┼──────────────────────────────────────────────────────────────────┤
+  │ action_sequence    │ [B,16,7]        │ 归一化 action                                                    │
+  ├────────────────────┼─────────────────┼──────────────────────────────────────────────────────────────────┤
+  │ language_embedding │ [B,512,D]       │ WAN T5 文本嵌入                                                  │
+  ├────────────────────┼─────────────────┼──────────────────────────────────────────────────────────────────┤
+  │ vlm_inputs         │ dict            │ Qwen3-VL 的 input_ids/attention_mask/pixel_values/image_grid_thw │
+  └────────────────────┴─────────────────┴──────────────────────────────────────────────────────────────────┘
+
+  train_step 把这些喂给 MotusWanVlmDirectMask.forward(...)（输入 first_frame / video_frames / state / actions / language_embeddings / vlm_inputs），同时学视频扩散 loss 和 action
+  loss（权重都是 1.0），VLM 是可训练的，WAN 也是 finetune（lr=5e-5）。
+
+  ---
+  3. 服务器/客户端架构怎么搭
+  
+  仓库里已经提供了完整的服务器和客户端代码，直接用即可：
+
+  - 服务器：Motus_initial_franka/inference/real_world/Motus/server_vlm_mask.py（FastAPI，端口默认 6789）
+  - 客户端：Motus_initial_franka/inference/real_world/Motus/client.py（HTTP POST）
+
+  3.1 启动服务器
+
+  cd Motus_initial_franka
+  python inference/real_world/Motus/server_vlm_mask.py \
+    --model_config configs/robotwin_wan_vlm_mask_stage2_franka.yaml \
+    --ckpt_dir  /path/to/your/franka_checkpoint \
+    --wan_path  /home/ma-user/work/wx1513998/pretrained_models \
+    --vlm_path  /home/ma-user/work/wx1513998/pretrained_models/Qwen3-VL-2B-Instruct \
+    --device cuda:0 \
+    --t5_embeddings_dir /path/to/franka_t5_embeddings_dir \
+    --host 0.0.0.0 --port 6789
+
+  注意：
+  - --ckpt_dir 指向训练保存的权重目录（DeepSpeed save_state 输出，里面有 mp_rank_00_model_states.pt 之类）。
+  - --t5_embeddings_dir 是按"任务指令 md5 slug"自动查找 T5 .pt 的目录（服务器里 slug = md5(instruction) → {slug}.pt）。Franka 训练时存的是 episode_XXXXXX.pt，按 episode 而不是按 instruction
+  命名，不能直接被 auto_find 命中，所以要么：
+    a. 用 precompute_franka_t5.py 的逻辑把每个唯一任务文本编一份存成 {md5(task_text)}.pt 放进这个目录；或
+    b. 客户端每次请求时显式传 t5_embeddings_path 指向对应的 episode_XXXXXX.pt；或
+    c. 让服务器端用 WAN T5 在线编码（需要改 server_vlm_mask.py，目前它没有 fallback，必须传 T5）。
+
+  3.2 客户端要上传什么
+
+  /inference 接口字段（InferenceRequest）：
+
+  ┌──────────────────────────────────────────────────┬────────┬────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+  │                       字段                       │  必填  │                                                            说明                                                            │
+  ├──────────────────────────────────────────────────┼────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ instruction                                      │ ✅     │ 任务文本，如 "place objects into the box"。必须和训练时 episode 里的 task 文本一致（T5/VLM 都用它）                        │
+  ├──────────────────────────────────────────────────┼────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ images                                           │ 推荐   │ 3 张 base64 图：[global_image, wrist_image, right_image]，服务器会调用 compose_multiview_image 拼成 T                      │
+  │                                                  │        │ 字形（与训练完全一致）                                                                                                     │
+  ├──────────────────────────────────────────────────┼────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ image                                            │ 二选一 │ 单张已拼接好的 base64 图（不传 images 时用）                                                                               │
+  ├──────────────────────────────────────────────────┼────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ image_path                                       │ 二选一 │ 服务器本地图片路径                                                                                                         │
+  ├──────────────────────────────────────────────────┼────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ state                                            │ ✅     │ Franka 7 维 qpos（未归一化的原始值，服务器不会归一化，直接喂模型；如果你的模型是用归一化 state 训的，需要客户端先自己用    │
+  │                                                  │        │ stats.json 归一化，因为 server 里 get_state_tensor 注释说 "No normalization — pass raw qpos"）                             │
+  ├──────────────────────────────────────────────────┼────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ t5_embeddings_path 或                            │ ✅     │ WAN T5 文本 embedding。客户端可传服务器本地 .pt 路径，或预编码好的 base64 tensor                                           │
+  │ t5_embeddings_dir+auto_find_t5_embeddings        │        │                                                                                                                            │
+  ├──────────────────────────────────────────────────┼────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ num_inference_steps                              │ 可选   │ 默认走 config 里的 10                                                                                                      │
+  ├──────────────────────────────────────────────────┼────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ return_frame_grid                                │ 可选   │ 是否返回预测视频帧拼图 base64                                                                                              │
+  └──────────────────────────────────────────────────┴────────┴────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+  客户端调用示例（Python，参考 client.py）：
+
+  from Motus.initial_franka...Motus.client import MotusAPIClient  # 实际路径按你部署
+  client = MotusAPIClient("http://<server_ip>:6789")
+
+  # 三张图必须是 RGB，按 [global, wrist_left, right] 顺序
+  images_b64 = [
+      encode_image_to_base64("global.png"),
+      encode_image_to_base64("wrist.png"),
+      encode_image_to_base64("right.png"),
+  ]
+
+  resp = client.run_inference(
+      instruction="place objects into the box",
+      images=images_b64,
+      state=[q1,q2,q3,q4,q5,q6,q7],            # 7 维 franka qpos
+      t5_embeddings_path="/server/local/path/episode_000000.pt",  # 或 t5_embeddings_dir
+      num_inference_steps=10,
+      return_frame_grid=False,
+  )
+  # resp["predicted_actions"]: shape [16, 7]，归一化值
+  # resp["action_shape"]: [16, 7]
+
+  注意：
+  - Franka 在训练里 action 和 state 都做了 [0,1] 归一化，所以 predicted_actions 是归一化值。服务器里 action_denorm 那段被注释掉了（server_vlm_mask.py 第 419-422 行），客户端拿到 action 
+  后需要自己用 franka_data/.../meta/stats.json 里的 action.min/max 反归一化：action_real = pred * (max - min) + min。
+  - state 同理，喂进去之前如果训练用的是归一化 state，客户端也要先归一化（server 没做）。
+  - 图片要在客户端拍/读取后转 base64；服务器会自动 resize_with_padding 到 384×320，所以原始分辨率不用严格 480×640，但比例别差太多。
+  - 如果只有一张全局图（没有腕部相机），可以传 image=单张base64，但效果会差，因为训练时模型看到的是三视图拼接。
+
+  3.3 客户端不需要上传的东西
+
+  - WAN 5B 权重、Qwen3-VL 权重、VAE、T5 编码器：都在服务器本地加载。
+  - 模型 checkpoint：服务器启动时加载。
+  - VLM processor：服务器本地加载（用来把图+指令编成 VLM token）。
+
+  3.4 端到端流程（服务器内部）
+
+  1. 收到请求 → get_input_image：若 images 有 3 张则 compose_multiview_image 拼 T 字形；否则用单张 image。
+  2. resize_image_with_padding(image, (384,320)) → first_frame tensor [1,3,384,320]（[0,1]）。
+  3. build_vlm_inputs：用 Qwen3-VL processor 把"拼接图 + instruction"编成 input_ids/attention_mask/pixel_values/image_grid_thw。
+  4. 加载 T5 embedding（t5_embeddings_path 或 auto-find）。
+  5. state → tensor [1,7]。
+  6. model.inference_step(first_frame, state, num_inference_steps, language_embeddings, vlm_inputs) → predicted_frames [1,8,3,384,320], predicted_actions [1,16,7]。
+  7. 返回 predicted_actions.tolist() + 元信息；可选返回预测视频帧拼图 base64。
+
+  ---
+  小结
+
+  - 数据格式：LeRobot v3.0，三路 mp4 视频（global/wrist/right）+ parquet(state/action) + 预计算 T5 embedding。
+  - 图片拼接：训练和推理都是"global 在上、wrist+right 在下并排"的 T 字形，再 resize_with_padding 到 384×320，作为 VLM 的输入图和 WAN 的视频条件帧。
+  - prompt：同一条任务文本同时走 WAN T5（→ language_embedding [1,512,D]）和 Qwen3-VL（→ chat template "image + text"，add_generation_prompt=True）。
+  - state/action：7 维 Franka qpos，训练时用 stats.json 归一化到 [0,1]。
+  - 服务器/客户端：用仓库自带的 server_vlm_mask.py + client.py。客户端要上传：任务指令、3 路相机图（base64 或服务器本地路径）、7 维 state、T5 embedding（路径或目录）。服务器返回 16×7 的归一化
+  action，客户端自己反归一化即可控制 Franka。
