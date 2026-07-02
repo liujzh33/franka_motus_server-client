@@ -269,3 +269,78 @@ CUDA_VISIBLE_DEVICES=4,5,6,7 torchrun --nproc_per_node=4 --master_port=28102 \
 Place all the objects on the desk into the white basket.Stack three bowls together.
   - 服务器/客户端：用仓库自带的 server_vlm_mask.py + client.py。客户端要上传：任务指令、3 路相机图（base64 或服务器本地路径）、7 维 state、T5 embedding（路径或目录）。服务器返回 16×7 的归一化
   action，客户端自己反归一化即可控制 Franka。
+
+
+t5_embedding/episode_XXXXXX.pt     是拿什么计算出来的，代码是那个                                                                                                                            
+
+  Thought for 6s (ctrl+o to expand)
+
+● 就是 Motus_initial_franka/precompute_franka_t5.py 这个脚本。我已经在前面读到过开头部分，现在完整读一遍。
+
+  Thought for 1s, read 1 file (ctrl+o to expand)
+
+● t5_embedding/episode_XXXXXX.pt 是用 WAN2.2 自带的 T5 编码器（umt5-xxl） 对每个 episode 的任务文本字符串编码后保存的。代码就是 Motus_initial_franka/precompute_franka_t5.py。
+
+  计算流程（对应代码）
+
+  1. 加载 T5 编码器 — load_t5_encoder()
+
+  from wan.modules.t5 import T5EncoderModel
+  encoder = T5EncoderModel(
+      text_len=512,
+      dtype=torch.bfloat16,
+      device="cuda",
+      checkpoint_path=".../Wan2.2-TI2V-5B/models_t5_umt5-xxl-enc-bf16.pth",
+      tokenizer_path=".../Wan2.2-TI2V-5B/google/umt5-xxl",
+  )
+
+  即 Wan2.2-5B 视频模型里那套 umt5-xxl 文本编码器（不是 Qwen3-VL，也不是别的 T5），权重路径写死在 pretrained_models/Wan2.2-TI2V-5B/ 下。
+
+  2. 读取每个 episode 的任务文本 — get_episodes_tasks()
+
+  从 LeRobot v3.0 的 meta/episodes/chunk-000/file-000.parquet 里读 episode_index 和 tasks 两列。tasks 字段可能是 list/ndarray/字符串，取第一个元素作为任务文本，例如 "place objects into the 
+  box"、"stack bowls"。
+
+  3. 编码唯一任务文本（去重，避免重复跑 T5）
+
+  unique_tasks = list(set(task for _, task in episodes))
+  for task in unique_tasks:
+      t5_out = encoder([task], device)   # batch=1
+      emb = t5_out[0] if isinstance(t5_out, list) else t5_out
+      if emb.ndim == 3 and emb.shape[0] == 1:
+          emb = emb.squeeze(0)            # → [512, D]
+      task_to_emb[task] = emb.cpu()
+
+  输出 shape 是 [512, D]（T5_TEXT_LEN=512，D 是 umt5-xxl 的 hidden size，bf16）。
+
+  4. 按 episode 落盘
+
+  out_dir = Path(dataset_root) / "t5_embedding"   # franka_data/<task>/t5_embedding/
+  for ep_idx, task_text in episodes:
+      torch.save(task_to_emb[task_text].detach().cpu(),
+                 out_dir / f"episode_{ep_idx:06d}.pt")
+
+  即同一任务的所有 episode 共用一份 embedding，但每个 episode 都存一个 episode_XXXXXX.pt 文件。处理的两个数据集写死在脚本顶部：
+
+  DATASETS = [
+      "/home/ma-user/work/wx1513998/franka_data/place_objects_into_the_box_rc_0524",
+      "/home/ma-user/work/wx1513998/franka_data/stack_bowls_rc",
+  ]
+
+  训练时怎么用
+
+  LeRobotMotusDataset.__getitem__ 里（lerobot_dataset.py 第 798-820 行附近）：
+  - 先按 episode_index 找 {dataset_root}/t5_embedding/episode_{ep:06d}.pt
+  - 找到就 torch.load → [1, 512, D]（若 ndim==2 会 unsqueeze）→ 作为 language_embedding 返回
+  - 找不到且 enable_t5_fallback=True 时，才会现场调同一个 T5EncoderModel 编码任务文本并缓存（_encode_and_cache_t5_embedding，lerobot_dataset.py 第 472-545 行），逻辑和 precompute_franka_t5.py
+  完全一致，只是惰性执行。
+  
+  所以 precompute_franka_t5.py 就是离线预计算版，把每个 episode 的任务文本用 WAN 的 umt5-xxl 编成 [512, D] 存盘，训练时直接 torch.load，避免每个 worker 在线跑 T5。
+
+  运行方式（如果需要重跑）：
+
+  cd Motus_initial_franka
+  python precompute_franka_t5.py
+
+  它会在 franka_data/place_objects_into_the_box_rc_0524/t5_embedding/ 和 franka_data/stack_bowls_rc/t5_embedding/ 下生成 episode_000000.pt ... episode_000273.pt（按各数据集 episode 数量）。
+
