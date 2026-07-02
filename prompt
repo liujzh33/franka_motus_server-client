@@ -266,15 +266,6 @@ CUDA_VISIBLE_DEVICES=4,5,6,7 torchrun --nproc_per_node=4 --master_port=28102 \
   6. model.inference_step(first_frame, state, num_inference_steps, language_embeddings, vlm_inputs) → predicted_frames [1,8,3,384,320], predicted_actions [1,16,7]。
   7. 返回 predicted_actions.tolist() + 元信息；可选返回预测视频帧拼图 base64。
 
-  ---
-  小结
-
-  - 数据格式：LeRobot v3.0，三路 mp4 视频（global/wrist/right）+ parquet(state/action) + 预计算 T5 embedding。
-  - 图片拼接：训练和推理都是"global 在上、wrist+right 在下并排"的 T 字形，再 resize_with_padding 到 384×320，作为 VLM 的输入图和 WAN 的视频条件帧。
-  - prompt：同一条任务文本同时走 WAN T5（→ language_embedding [1,512,D]）和 Qwen3-VL（→ chat template "image + text"，add_generation_prompt=True）。
-  - state/action：7 维 Franka qpos，训练时用 stats.json 归一化到 [0,1]。
-
-
 Place all the objects on the desk into the white basket.Stack three bowls together.
   - 服务器/客户端：用仓库自带的 server_vlm_mask.py + client.py。客户端要上传：任务指令、3 路相机图（base64 或服务器本地路径）、7 维 state、T5 embedding（路径或目录）。服务器返回 16×7 的归一化
   action，客户端自己反归一化即可控制 Franka。
