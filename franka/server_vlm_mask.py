@@ -108,9 +108,40 @@ class ServerState:
         self.default_instruction: Optional[str] = None
         self.default_t5_embeddings_path: Optional[str] = None
         self.default_language_embeddings: Optional[List[torch.Tensor]] = None
+        # Action/state normalization stats (loaded from stats.json)
+        self.action_min: Optional[np.ndarray] = None
+        self.action_max: Optional[np.ndarray] = None
+        self.state_min: Optional[np.ndarray] = None
+        self.state_max: Optional[np.ndarray] = None
+        self.normalize_state: bool = False
+        self.denormalize_action: bool = False
 
 
 SERVER_STATE = ServerState()
+
+
+def load_normalization_stats(stats_path: str) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Load action/state min/max from LeRobot v3.0 stats.json.
+
+    Returns (action_min, action_max, state_min, state_max) as float32 numpy arrays.
+    Falls back to action stats for state if state stats are missing.
+    """
+    import json
+
+    with open(stats_path, "r") as f:
+        stats = json.load(f)
+
+    action_min = np.array(stats["action"]["min"], dtype=np.float32)
+    action_max = np.array(stats["action"]["max"], dtype=np.float32)
+
+    if "state" in stats:
+        state_min = np.array(stats["state"]["min"], dtype=np.float32)
+        state_max = np.array(stats["state"]["max"], dtype=np.float32)
+    else:
+        state_min = action_min.copy()
+        state_max = action_max.copy()
+
+    return action_min, action_max, state_min, state_max
 
 
 def load_yaml_config(path: str) -> Dict[str, Any]:
@@ -239,6 +270,7 @@ def load_server_components(
     default_instruction: Optional[str],
     default_instruction_file: Optional[str],
     default_t5_embeddings_path: Optional[str],
+    stats_path: Optional[str] = None,
 ) -> None:
     resolved_device = torch.device(device if device else ("cuda" if torch.cuda.is_available() else "cpu"))
     config_dict = load_yaml_config(model_config_path)
@@ -310,6 +342,25 @@ def load_server_components(
         )
         log.info("Loaded default T5 embeddings from %s", SERVER_STATE.default_t5_embeddings_path)
 
+    # Load action/state normalization stats
+    if stats_path:
+        action_min, action_max, state_min, state_max = load_normalization_stats(stats_path)
+        SERVER_STATE.action_min = action_min
+        SERVER_STATE.action_max = action_max
+        SERVER_STATE.state_min = state_min
+        SERVER_STATE.state_max = state_max
+        SERVER_STATE.normalize_state = True
+        SERVER_STATE.denormalize_action = True
+        log.info(
+            "Loaded normalization stats from %s: action_min=%s, action_max=%s, state_min=%s, state_max=%s",
+            stats_path, action_min.tolist(), action_max.tolist(), state_min.tolist(), state_max.tolist(),
+        )
+    else:
+        log.warning(
+            "No stats_path provided. State normalization and action denormalization are DISABLED. "
+            "Client must send normalized state and will receive normalized actions."
+        )
+
     log.info("Loaded Franka Motus model from %s", ckpt_dir)
     log.info("Loaded VLM processor from %s", vlm_path)
 
@@ -350,7 +401,14 @@ def get_state_tensor(state_values: Optional[List[float]], state_dim: int, device
         return torch.zeros((1, state_dim), dtype=torch.float32, device=device)
     if len(state_values) != state_dim:
         raise ValueError(f"State length mismatch: expected {state_dim}, got {len(state_values)}.")
-    return torch.tensor(state_values, dtype=torch.float32, device=device).unsqueeze(0)
+    state_np = np.array(state_values, dtype=np.float32)
+    # Normalize state to [0,1] using training stats (raw ee pose -> normalized)
+    if SERVER_STATE.normalize_state and SERVER_STATE.state_min is not None and SERVER_STATE.state_max is not None:
+        state_range = SERVER_STATE.state_max - SERVER_STATE.state_min
+        state_range = np.where(state_range == 0, 1.0, state_range)
+        state_np = (state_np - SERVER_STATE.state_min) / state_range
+        state_np = np.clip(state_np, 0.0, 1.0)
+    return torch.from_numpy(state_np).to(device).unsqueeze(0)
 
 
 def load_t5_embeddings(path: str, device: torch.device) -> List[torch.Tensor]:
@@ -432,6 +490,16 @@ def run_model_inference(request: InferenceRequest) -> InferenceResponse:
     if predicted_actions_cpu.dim() == 1:
         predicted_actions_cpu = predicted_actions_cpu.unsqueeze(0)
 
+    # Denormalize actions from [0,1] back to original ee pose scale
+    actions_denorm = False
+    if SERVER_STATE.denormalize_action and SERVER_STATE.action_min is not None and SERVER_STATE.action_max is not None:
+        action_range = SERVER_STATE.action_max - SERVER_STATE.action_min
+        action_range = np.where(action_range == 0, 1.0, action_range)
+        pred_np = predicted_actions_cpu.numpy()
+        pred_np = pred_np * action_range + SERVER_STATE.action_min
+        predicted_actions_cpu = torch.from_numpy(pred_np).float()
+        actions_denorm = True
+
     frame_grid_b64 = None
     if request.return_frame_grid:
         first_frame_np = first_frame.squeeze(0).detach().cpu().float().clamp(0, 1).permute(1, 2, 0).numpy()
@@ -467,6 +535,10 @@ def run_model_inference(request: InferenceRequest) -> InferenceResponse:
             "t5_embeddings_dir": SERVER_STATE.t5_embeddings_dir,
             "default_instruction": SERVER_STATE.default_instruction,
             "default_t5_embeddings_path": SERVER_STATE.default_t5_embeddings_path,
+            "actions_denormalized": actions_denorm,
+            "state_normalized": SERVER_STATE.normalize_state,
+            "action_min": SERVER_STATE.action_min.tolist() if SERVER_STATE.action_min is not None else None,
+            "action_max": SERVER_STATE.action_max.tolist() if SERVER_STATE.action_max is not None else None,
         },
         timestamp=datetime.now().isoformat(),
         action_shape=list(predicted_actions_cpu.shape),
@@ -641,6 +713,13 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--default_instruction", default=None, help="Default instruction used when a request omits it")
     parser.add_argument("--default_instruction_file", default=None, help="Path to a text file containing the default instruction")
     parser.add_argument("--default_t5_embeddings_path", default=None, help="Precomputed default T5 embedding .pt file")
+    parser.add_argument(
+        "--stats_path",
+        default=None,
+        help="Path to LeRobot v3.0 stats.json. When provided, the server normalizes incoming state to [0,1] "
+        "and denormalizes predicted_actions back to the original ee pose scale. "
+        "Example: franka_data/place_objects_into_the_box_rc_0524/meta/stats.json",
+    )
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", default=8090, type=int)
     return parser
@@ -659,6 +738,7 @@ def main() -> None:
         default_instruction=args.default_instruction,
         default_instruction_file=args.default_instruction_file,
         default_t5_embeddings_path=args.default_t5_embeddings_path,
+        stats_path=args.stats_path,
     )
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
 
