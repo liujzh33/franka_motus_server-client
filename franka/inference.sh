@@ -19,12 +19,10 @@ case "$TASK" in
   place)
     DEFAULT_INSTRUCTION_FILE_DEFAULT="$ROOT_DIR/franka/place_objects_instruction.txt"
     DEFAULT_T5_EMBEDDINGS_PATH_DEFAULT="$ROOT_DIR/franka/place_objects_instruction.pt"
-    DEFAULT_STATS_PATH_DEFAULT="/home/ma-user/work/wx1513998/franka_data/place_objects_into_the_box_rc_0524/meta/stats.json"
     ;;
   stack)
     DEFAULT_INSTRUCTION_FILE_DEFAULT="$ROOT_DIR/franka/stack_bowls_instruction.txt"
     DEFAULT_T5_EMBEDDINGS_PATH_DEFAULT="$ROOT_DIR/franka/stack_bowls_instruction.pt"
-    DEFAULT_STATS_PATH_DEFAULT="/home/ma-user/work/wx1513998/franka_data/stack_bowls_rc/meta/stats.json"
     ;;
   *)
     echo "Unsupported TASK='$TASK'. Use TASK=place or TASK=stack." >&2
@@ -32,9 +30,10 @@ case "$TASK" in
     ;;
 esac
 
+# Training uses data/utils/stat.json (key="franka") for BOTH tasks, not per-task stats.json.
 DEFAULT_INSTRUCTION_FILE="${DEFAULT_INSTRUCTION_FILE:-$DEFAULT_INSTRUCTION_FILE_DEFAULT}"
 DEFAULT_T5_EMBEDDINGS_PATH="${DEFAULT_T5_EMBEDDINGS_PATH:-$DEFAULT_T5_EMBEDDINGS_PATH_DEFAULT}"
-DEFAULT_STATS_PATH="${DEFAULT_STATS_PATH:-$DEFAULT_STATS_PATH_DEFAULT}"
+DEFAULT_STATS_PATH="${DEFAULT_STATS_PATH:-$ROOT_DIR/data/utils/stat.json}"
 
 : "${CKPT_DIR:?Set CKPT_DIR to the Franka checkpoint directory before running this script.}"
 
