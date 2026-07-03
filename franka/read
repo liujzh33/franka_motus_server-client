@@ -1,0 +1,513 @@
+ 下面把 Motus_initial_franka/franka/server_vlm_mask.py + 训练数据 + 模型代码对照起来回答你这几个问题。结论先放在前面，再贴代码证据。
+     
+  ---
+  一、训练时 action/state 到底是什么
+  
+  从 franka_data/place_objects_into_the_box_rc_0524/meta/stats.json 直接读出来的 min/max（stack_bowls_rc 也一样）：
+
+  action / state 共 7 维
+  dim0:  [0.295, 0.625]   → x  (米)
+  dim1:  [-0.101, 0.420]  → y  (米)
+  dim2:  [0.208, 0.525]   → z  (米)
+  dim3:  [2.793, 3.767]   → roll  (弧度)
+  dim4:  [-0.303, 0.346]  → pitch (弧度)
+  dim5:  [1.043, 2.109]   → yaw   (弧度)
+  dim6:  [0.0, 1.0]       → gripper (0=闭合/1=张开)
+
+  可以确认：
+  - 格式就是 [x, y, z, roll, pitch, yaw, gripper] 末端位姿，和你说的一致。
+  - 第 7 维就是 gripper，范围 [0,1]（已经是归一化的开合量）。
+  - action 和 state 的 min/max 几乎完全相同（如 dim0 action.min=0.29549 vs state.min=0.29547），说明 action 是绝对目标位姿，不是 delta。模型预测的是未来 16 步的绝对目标 ee pose。
+
+  二、训练时的归一化（关键）
+
+  data/lerobot/lerobot_dataset.py 的 __getitem__ 末尾：
+
+  normalized_actions = normalize_actions(action_sequence, self.action_min, self.action_max)
+  normalized_initial_state = normalize_actions(initial_state.unsqueeze(0), self.action_min, self.action_max).squeeze(0)
+
+  data/utils/norm.py：
+
+  normalized = (actions_np - action_min) / (max - min)   # → [0,1]
+
+  action_min/action_max 来自 meta/stats.json（embodiment_type="franka"）。所以：
+
+  - 训练时 state 和 action 都被归一化到 [0,1] 后才喂给模型 / 当作 target。
+  - 模型 inference_step（models/motus_wan_vlm_direct_mask.py:1516）里 state 直接 state.unsqueeze(1) 当 token，模型内部不做归一化；输出 predicted_actions = 
+  action_latent.float()，模型内部不做反归一化。
+  - 视频帧倒是模型内部做了 [0,1]↔[-1,1]：first_frame_norm = first_frame*2-1，输出 predicted_frames = (predicted_frames+1)/2。但 action/state 没有。
+
+  三、服务器端做了什么、没做什么
+
+  franka/server_vlm_mask.py：
+
+  def get_state_tensor(state_values, state_dim, device):
+      # 注释: No normalization — pass raw qpos directly to model
+      return torch.tensor(state_values, ...).unsqueeze(0)
+
+  run_model_inference 里：
+  - state = get_state_tensor(resolve_state_values(request), ...) → 不归一化
+  - predicted_actions_cpu = predicted_actions.detach().cpu().float() → 不反归一化，直接 .tolist() 返回
+
+  也就是说 这个 franka 服务器既不归一化 state，也不反归一化 action。这和训练时的预处理是对不上的，所以归一化/反归一化必须由客户端来做（或者你改服务器加上 stats）。
+
+  proprio_data 字段怎么用
+
+  InferenceRequest 里：
+
+  proprio_data: Optional[List[List[float]]]   # "Custom proprioception sequence. The last state is used for inference."
+  state: Optional[List[float]]                # "Single Franka state vector."
+
+  resolve_state_values：
+
+  if request.state is not None: return request.state
+  if request.proprio_data is not None:
+      return [float(x) for x in request.proprio_data[-1]]   # 只取最后一帧
+
+  即 proprio_data 是一个历史序列（比如最近 N 帧的 ee pose），服务器只用最后一个作为当前 state。state 是单帧。两者二选一，对模型来说等价（都只是 1 帧 state）。
+
+  由于 Franka 训练时 state 就是 ee pose（不是关节角），所以：
+  - proprio_data/state 应传末端位姿 [x,y,z,roll,pitch,yaw,gripper]，并且要先归一化到 [0,1]（用 stats.json 的 min/max）。
+  - 服务器代码注释里写的 "raw qpos" 是从 Dobot/Franka 通用模板复制过来的残留注释，对 Franka 这套数据是误导——Franka 数据里根本没有 qpos，state 就是 ee pose。
+
+  四、predicted_actions 是什么
+
+  run_model_inference 返回：
+
+  predicted_actions = predicted_actions_cpu.tolist()   # List[List[float]], shape [16, 7]
+  action_shape = [16, 7]
+
+  - shape 恒为 [16, 7]（action_chunk_size = num_video_frames * video_action_freq_ratio = 8*2 = 16，action_dim=7）
+  - 16 步对应训练时的 action_indices = [cond+(i+1)*3 for i in range(16)]，即未来 ~1.6 秒（@30fps，间隔 3 帧）的目标位姿序列
+  - 值域 [0,1]，是归一化后的绝对 ee pose（[x,y,z,roll,pitch,yaw,gripper]）
+  - 客户端必须反归一化：real = pred * (max - min) + min，用对应任务的 stats.json
+
+  五、客户端应该怎么做（端到端）
+
+  假设你跑的是 place_objects_into_the_box_rc_0524 任务，正确流程：
+
+  1. 加载 stats.json（客户端本地）
+  import json, numpy as np
+  stats = json.load(open("franka_data/place_objects_into_the_box_rc_0524/meta/stats.json"))
+  action_min = np.array(stats["action"]["min"])  # shape [7]
+  action_max = np.array(stats["action"]["max"])
+  state_min  = action_min   # state 和 action 用同一套 min/max（几乎相同）
+  state_max  = action_max
+  
+  2. 采集当前 Franka 真机状态
+  ee_pose = robot.get_ee_pose()        # [x,y,z,roll,pitch,yaw]
+  gripper = robot.get_gripper()        # [0,1] 或映射到 [0,1]
+  state_raw = np.array([*ee_pose, gripper])   # [7]
+  state_norm = (state_raw - state_min) / (state_max - state_min)  # → [0,1]
+
+  3. 采集 3 路相机图，base64 编码
+  顺序必须和训练一致：[global_image, wrist_image, right_image]（global 在上、wrist 在下左、right 在下右拼成 T 字形，服务器 compose_multiview_image 会做拼接）。
+
+  4. 发 WebSocket/HTTP 请求
+  payload = {
+      "images": [global_b64, wrist_b64, right_b64],
+      "proprio_data": [state_norm.tolist()],   # 传归一化后的；或用 "state": state_norm.tolist()
+      "t5_embeddings_path": "/server/path/to/place_objects_instruction.pt",
+      # instruction 可不传，服务器启动时已用 --default_instruction_file 配好
+  }
+  # POST /inference 或 ws /ws
+
+  5. 收到 predicted_actions，反归一化
+  pred_norm = np.array(resp["predicted_actions"])     # [16, 7], 值域 [0,1]
+  pred_real = pred_norm * (action_max - action_min) + action_min   # → 真实 ee pose
+  # pred_real[:, :3]  = x,y,z (米)
+  # pred_real[:, 3:6] = roll,pitch,yaw (弧度)
+  # pred_real[:, 6]   = gripper [0,1]
+
+  6. 下发给 Franka
+  按 16 步序列逐点执行绝对位姿移动（绝对目标，不是 delta），gripper 用第 7 维。
+
+  六、几个坑要特别注意
+
+  1. 服务器不归一化 state：如果你直接传原始 ee pose，模型会收到量级完全不对的输入（训练时是 [0,1]），预测会废。必须客户端自己归一化，或修改 server_vlm_mask.py:get_state_tensor 加上 stats
+  归一化。
+  2. 服务器不反归一化 action：返回的是 [0,1] 归一化值，客户端必须反归一化才能下发。
+  3. roll/pitch/yaw 的表示：训练数据里 dim3 范围 2.79-3.77（接近 π），dim5 范围
+  1.04-2.11，说明用的是弧度，而且不是标准的欧拉角约定（可能存在多值性）。真机下发时要确保和采集数据时用的姿态表示完全一致（同样的旋转顺序、同样的分支），否则会出现姿态跳变。
+  4. gripper 方向：min=0, max=1，训练数据里 0 和 1 都出现，但 0 是闭合还是张开需要你对照采集脚本确认（通常 RoboTwin/Franka 遥采里 1=张开、0=闭合）。
+  5. T5 embedding：服务器启动时通过 --default_t5_embeddings_path franka/place_objects_instruction.pt 加载了默认 T5（对应 place_objects 或 stack_bowls 任务文本），客户端不传 t5_embeddings_path
+  也能用。如果换任务，要么换服务器启动参数，要么客户端传对应的 .pt 路径。
+  6. 3 路相机顺序：images=[global, wrist, right]，顺序不能乱，否则拼接图和训练分布不一致。
+  7. state 归一化用哪套 min/max：训练时 state 和 action 用的是同一个 stats.json 里的 action 列（load_normalization_stats 返回的就是 action 的 min/max，state 也用它）。从 stats 看 state 和
+  action 几乎相同，用 action 的就行。
+
+  ---
+  如果你想省事，最干净的做法是改 franka/server_vlm_mask.py：启动时加载 stats.json，在 get_state_tensor 里归一化 state，在 run_model_inference 末尾反归一化
+  predicted_actions，这样客户端就只传/收原始 ee pose。需要的话我可以帮你改。
+
+✻ Worked for 4m 20s
+
+❯ 好的改一下代码，然后告诉我需要把那些代码和什么数据传输出去，例如需要把那些 stats.json传输出去                                                                                                
+
+  Thought for 8s, searched for 1 pattern (ctrl+o to expand)
+
+● Bash(sed -n '232,320p' /home/ma-user/work/wx1513998/Motus_initial_franka/franka/server_vlm_mask.py)
+  ⎿  def load_server_components(
+         model_config_path: str,
+         ckpt_dir: str,
+     … +86 lines (ctrl+o to expand)
+
+● Bash(sed -n '633,690p' /home/ma-user/work/wx1513998/Motus_initial_franka/franka/server_vlm_mask.py)
+  ⎿  def build_argparser() -> argparse.ArgumentParser:
+         parser = argparse.ArgumentParser(description="Franka Motus HTTP/WebSocket inference server")
+         parser.add_argument("--model_config", required=True, help="Path to YAML config")
+     … +32 lines (ctrl+o to expand)
+
+  Thought for 4s (ctrl+o to expand)
+
+● 下面把 franka/server_vlm_mask.py 改成：服务器启动时加载 stats.json，请求时自动归一化 state、自动反归一化 predicted_actions，客户端只传/收原始 ee pose。
+
+● Update(Motus_initial_franka/franka/server_vlm_mask.py)
+  ⎿  Added 7 lines
+      108          self.default_instruction: Optional[str] = None
+      109          self.default_t5_embeddings_path: Optional[str] = None
+      110          self.default_language_embeddings: Optional[List[torch.Tensor]] = None
+      111 +        # Action/state normalization stats (loaded from stats.json)                                                                                                          
+      112 +        self.action_min: Optional[np.ndarray] = None                                                                                                                         
+      113 +        self.action_max: Optional[np.ndarray] = None                                                                                                                         
+      114 +        self.state_min: Optional[np.ndarray] = None                                                                                                                          
+      115 +        self.state_max: Optional[np.ndarray] = None                                                                                                                          
+      116 +        self.normalize_state: bool = False                                                                                                                                   
+      117 +        self.denormalize_action: bool = False                                                                                                                                
+      118  
+      119  
+      120  SERVER_STATE = ServerState()
+
+● 现在加一个加载 stats.json 的函数，并在 load_server_components 里调用：
+
+● Update(Motus_initial_franka/franka/server_vlm_mask.py)
+  ⎿  Added 24 lines
+      120  SERVER_STATE = ServerState()
+      121  
+      122  
+      123 +def load_normalization_stats(stats_path: str) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:                                                                      
+      124 +    """Load action/state min/max from LeRobot v3.0 stats.json.                                                                                                               
+      125 +                                                                                                                                                                             
+      126 +    Returns (action_min, action_max, state_min, state_max) as float32 numpy arrays.                                                                                          
+      127 +    Falls back to action stats for state if state stats are missing.                                                                                                         
+      128 +    """                                                                                                                                                                      
+      129 +    import json                                                                                                                                                              
+      130 +                                                                                                                                                                             
+      131 +    with open(stats_path, "r") as f:                                                                                                                                         
+      132 +        stats = json.load(f)                                                                                                                                                 
+      133 +                                                                                                                                                                             
+      134 +    action_min = np.array(stats["action"]["min"], dtype=np.float32)                                                                                                          
+      135 +    action_max = np.array(stats["action"]["max"], dtype=np.float32)                                                                                                          
+      136 +                                                                                                                                                                             
+      137 +    if "state" in stats:                                                                                                                                                     
+      138 +        state_min = np.array(stats["state"]["min"], dtype=np.float32)                                                                                                        
+      139 +        state_max = np.array(stats["state"]["max"], dtype=np.float32)                                                                                                        
+      140 +    else:                                                                                                                                                                    
+      141 +        state_min = action_min.copy()                                                                                                                                        
+      142 +        state_max = action_max.copy()                                                                                                                                        
+      143 +                                                                                                                                                                             
+      144 +    return action_min, action_max, state_min, state_max                                                                                                                      
+      145 +                                                                                                                                                                             
+      146 +                                                                                                                                                                             
+      147  def load_yaml_config(path: str) -> Dict[str, Any]:
+      148      import yaml
+      149  
+
+● 修改 load_server_components 签名和内部加载 stats：
+
+● Update(Motus_initial_franka/franka/server_vlm_mask.py)
+  ⎿  Added 1 line
+      270      default_instruction: Optional[str],
+      271      default_instruction_file: Optional[str],
+      272      default_t5_embeddings_path: Optional[str],
+      273 +    stats_path: Optional[str] = None,                                                                                                                                        
+      274  ) -> None:
+      275      resolved_device = torch.device(device if device else ("cuda" if torch.cuda.is_available() else "cpu"))
+      276      config_dict = load_yaml_config(model_config_path)
+
+● Update(Motus_initial_franka/franka/server_vlm_mask.py)
+  ⎿  Added 19 lines
+      342          )
+      343          log.info("Loaded default T5 embeddings from %s", SERVER_STATE.default_t5_embeddings_path)
+      344  
+      345 +    # Load action/state normalization stats                                                                                                                                  
+      346 +    if stats_path:                                                                                                                                                           
+      347 +        action_min, action_max, state_min, state_max = load_normalization_stats(stats_path)                                                                                  
+      348 +        SERVER_STATE.action_min = action_min                                                                                                                                 
+      349 +        SERVER_STATE.action_max = action_max                                                                                                                                 
+      350 +        SERVER_STATE.state_min = state_min                                                                                                                                   
+      351 +        SERVER_STATE.state_max = state_max                                                                                                                                   
+      352 +        SERVER_STATE.normalize_state = True                                                                                                                                  
+      353 +        SERVER_STATE.denormalize_action = True                                                                                                                               
+      354 +        log.info(                                                                                                                                                            
+      355 +            "Loaded normalization stats from %s: action_min=%s, action_max=%s, state_min=%s, state_max=%s",                                                                  
+      356 +            stats_path, action_min.tolist(), action_max.tolist(), state_min.tolist(), state_max.tolist(),                                                                    
+      357 +        )                                                                                                                                                                    
+      358 +    else:                                                                                                                                                                    
+      359 +        log.warning(                                                                                                                                                         
+      360 +            "No stats_path provided. State normalization and action denormalization are DISABLED. "                                                                          
+      361 +            "Client must send normalized state and will receive normalized actions."                                                                                         
+      362 +        )                                                                                                                                                                    
+      363 +                                                                                                                                                                             
+      364      log.info("Loaded Franka Motus model from %s", ckpt_dir)
+      365      log.info("Loaded VLM processor from %s", vlm_path)
+      366  
+
+● 修改 get_state_tensor 加归一化：
+
+● Update(Motus_initial_franka/franka/server_vlm_mask.py)
+  ⎿  Added 8 lines, removed 1 line
+      401          return torch.zeros((1, state_dim), dtype=torch.float32, device=device)
+      402      if len(state_values) != state_dim:
+      403          raise ValueError(f"State length mismatch: expected {state_dim}, got {len(state_values)}.")
+      404 -    return torch.tensor(state_values, dtype=torch.float32, device=device).unsqueeze(0)                                                                                       
+      404 +    state_np = np.array(state_values, dtype=np.float32)                                                                                                                      
+      405 +    # Normalize state to [0,1] using training stats (raw ee pose -> normalized)                                                                                              
+      406 +    if SERVER_STATE.normalize_state and SERVER_STATE.state_min is not None and SERVER_STATE.state_max is not None:                                                           
+      407 +        state_range = SERVER_STATE.state_max - SERVER_STATE.state_min                                                                                                        
+      408 +        state_range = np.where(state_range == 0, 1.0, state_range)                                                                                                           
+      409 +        state_np = (state_np - SERVER_STATE.state_min) / state_range                                                                                                         
+      410 +        state_np = np.clip(state_np, 0.0, 1.0)                                                                                                                               
+      411 +    return torch.from_numpy(state_np).to(device).unsqueeze(0)                                                                                                                
+      412  
+      413  
+      414  def load_t5_embeddings(path: str, device: torch.device) -> List[torch.Tensor]:
+
+● 在 run_model_inference 里加 action 反归一化。先看当前 predicted_actions 处理那段的精确内容：
+
+  Searched for 1 pattern, read 1 file (ctrl+o to expand)
+
+● Update(Motus_initial_franka/franka/server_vlm_mask.py)
+  ⎿  Added 10 lines
+      490      if predicted_actions_cpu.dim() == 1:
+      491          predicted_actions_cpu = predicted_actions_cpu.unsqueeze(0)
+      492  
+      493 +    # Denormalize actions from [0,1] back to original ee pose scale                                                                                                          
+      494 +    actions_denorm = False                                                                                                                                                   
+      495 +    if SERVER_STATE.denormalize_action and SERVER_STATE.action_min is not None and SERVER_STATE.action_max is not None:                                                      
+      496 +        action_range = SERVER_STATE.action_max - SERVER_STATE.action_min                                                                                                     
+      497 +        action_range = np.where(action_range == 0, 1.0, action_range)                                                                                                        
+      498 +        pred_np = predicted_actions_cpu.numpy()                                                                                                                              
+      499 +        pred_np = pred_np * action_range + SERVER_STATE.action_min                                                                                                           
+      500 +        predicted_actions_cpu = torch.from_numpy(pred_np).float()                                                                                                            
+      501 +        actions_denorm = True                                                                                                                                                
+      502 +                                                                                                                                                                             
+      503      frame_grid_b64 = None
+      504      if request.return_frame_grid:
+      505          first_frame_np = first_frame.squeeze(0).detach().cpu().float().clamp(0, 1).permute(1, 2, 0).numpy()
+
+● 在 response 的 model_info 里加一个标记，让客户端知道 action 是否已反归一化。先找到 model_info 那段：
+
+  Searched for 1 pattern, read 1 file (ctrl+o to expand)
+
+● Update(Motus_initial_franka/franka/server_vlm_mask.py)
+  ⎿  Added 4 lines
+      535              "t5_embeddings_dir": SERVER_STATE.t5_embeddings_dir,
+      536              "default_instruction": SERVER_STATE.default_instruction,
+      537              "default_t5_embeddings_path": SERVER_STATE.default_t5_embeddings_path,
+      538 +            "actions_denormalized": actions_denorm,                                                                                                                          
+      539 +            "state_normalized": SERVER_STATE.normalize_state,                                                                                                                
+      540 +            "action_min": SERVER_STATE.action_min.tolist() if SERVER_STATE.action_min is not None else None,                                                                 
+      541 +            "action_max": SERVER_STATE.action_max.tolist() if SERVER_STATE.action_max is not None else None,                                                                 
+      542          },
+      543          timestamp=datetime.now().isoformat(),
+      544          action_shape=list(predicted_actions_cpu.shape),
+
+● 现在加 argparser 参数并传给 load_server_components：
+
+● Update(Motus_initial_franka/franka/server_vlm_mask.py)
+  ⎿  Added 7 lines
+      713      parser.add_argument("--default_instruction", default=None, help="Default instruction used when a request omits it")
+      714      parser.add_argument("--default_instruction_file", default=None, help="Path to a text file containing the default instruction")
+      715      parser.add_argument("--default_t5_embeddings_path", default=None, help="Precomputed default T5 embedding .pt file")
+      716 +    parser.add_argument(                                                                                                                                                     
+      717 +        "--stats_path",                                                                                                                                                      
+      718 +        default=None,                                                                                                                                                        
+      719 +        help="Path to LeRobot v3.0 stats.json. When provided, the server normalizes incoming state to [0,1] "                                                                
+      720 +        "and denormalizes predicted_actions back to the original ee pose scale. "                                                                                            
+      721 +        "Example: franka_data/place_objects_into_the_box_rc_0524/meta/stats.json",                                                                                           
+      722 +    )                                                                                                                                                                        
+      723      parser.add_argument("--host", default="0.0.0.0")
+      724      parser.add_argument("--port", default=8090, type=int)
+      725      return parser
+
+● Update(Motus_initial_franka/franka/server_vlm_mask.py)
+  ⎿  Added 1 line
+      738          default_instruction=args.default_instruction,
+      739          default_instruction_file=args.default_instruction_file,
+      740          default_t5_embeddings_path=args.default_t5_embeddings_path,
+      741 +        stats_path=args.stats_path,                                                                                                                                          
+      742      )
+      743      uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+      744  
+
+● 现在同步更新 inference.sh，让它自动把对应任务的 stats.json 传进去：
+
+● Update(Motus_initial_franka/franka/inference.sh)
+  ⎿  Added 3 lines
+      19    place)
+      24    stack)
+      25      DEFAULT_INSTRUCTION_FILE_DEFAULT="$ROOT_DIR/franka/stack_bowls_instruction.txt"
+      26      DEFAULT_T5_EMBEDDINGS_PATH_DEFAULT="$ROOT_DIR/franka/stack_bowls_instruction.pt"
+      27 +    DEFAULT_STATS_PATH_DEFAULT="/home/ma-user/work/wx1513998/franka_data/stack_bowls_rc/meta/stats.json"                                                                      
+      28      ;;
+      29    *)
+      30      echo "Unsupported TASK='$TASK'. Use TASK=place or TASK=stack." >&2
+     ...
+      34  
+      35  DEFAULT_INSTRUCTION_FILE="${DEFAULT_INSTRUCTION_FILE:-$DEFAULT_INSTRUCTION_FILE_DEFAULT}"
+      36  DEFAULT_T5_EMBEDDINGS_PATH="${DEFAULT_T5_EMBEDDINGS_PATH:-$DEFAULT_T5_EMBEDDINGS_PATH_DEFAULT}"
+      37 +DEFAULT_STATS_PATH="${DEFAULT_STATS_PATH:-$DEFAULT_STATS_PATH_DEFAULT}"                                                                                                       
+      38  
+      39  : "${CKPT_DIR:?Set CKPT_DIR to the Franka checkpoint directory before running this script.}"
+      40  
+
+● Update(Motus_initial_franka/franka/inference.sh)
+  ⎿  Added 6 lines
+      64    exit 1
+      65  fi
+      66  
+      67 +if [[ ! -f "$DEFAULT_STATS_PATH" ]]; then                                                                                                                                     
+      68 +  echo "DEFAULT_STATS_PATH not found: $DEFAULT_STATS_PATH" >&2                                                                                                                
+      69 +  echo "Provide the LeRobot v3.0 stats.json for state/action normalization." >&2                                                                                              
+      70 +  exit 1                                                                                                                                                                      
+      71 +fi                                                                                                                                                                            
+      72 +                                                                                                                                                                              
+      73  CMD=(
+      74    python franka/server_vlm_mask.py
+      75    --model_config "$MODEL_CONFIG"
+
+● Update(Motus_initial_franka/franka/inference.sh)
+  ⎿  Added 4 lines
+       93    CMD+=(--default_t5_embeddings_path "$DEFAULT_T5_EMBEDDINGS_PATH")
+       94  fi
+       95  
+       96 +if [[ -f "$DEFAULT_STATS_PATH" ]]; then                                                                                                                                      
+       97 +  CMD+=(--stats_path "$DEFAULT_STATS_PATH")                                                                                                                                  
+       98 +fi                                                                                                                                                                           
+       99 +                                                                                                                                                                             
+      100  echo "Launching Franka server with:"
+      101  printf '  %q' "${CMD[@]}"
+      102  printf '\n'
+
+● 验证改动没有语法错误：
+
+● Bash(cd /home/ma-user/work/wx1513998/Motus_initial_franka && python3 -c "import ast; ast.parse(open('franka/server_vlm_mask.py').read()); print('server_vlm_mask.py:…)
+  ⎿  server_vlm_mask.py: syntax OK
+     inference.sh: syntax OK
+
+● 改动完成。下面是完整说明。
+
+  ---
+  改了什么
+  
+  1. franka/server_vlm_mask.py
+
+  ┌─────────────────────────────────────────────────────────────────────────────────────────────┬──────────────────────────────────────────────────────────────────────────────────────────┐
+  │                                           改动点                                            │                                           作用                                           │
+  ├─────────────────────────────────────────────────────────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────┤
+  │ ServerState 新增 action_min/max、state_min/max、normalize_state、denormalize_action 字段    │ 存归一化统计量                                                                           │
+  ├─────────────────────────────────────────────────────────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────┤
+  │ 新增 load_normalization_stats(stats_path) 函数                                              │ 从 LeRobot v3.0 stats.json 读 action/state 的 min/max                                    │
+  ├─────────────────────────────────────────────────────────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────┤
+  │ load_server_components 新增 stats_path 参数                                                 │ 启动时加载 stats，设置归一化开关                                                         │
+  ├─────────────────────────────────────────────────────────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────┤
+  │ get_state_tensor                                                                            │ 自动把客户端传来的原始 ee pose 归一化到 [0,1]（(x-min)/(max-min)，再                     │
+  │                                                                                             │ clip），模型收到的和训练时一致                                                           │
+  ├─────────────────────────────────────────────────────────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────┤
+  │ run_model_inference 末尾                                                                    │ 自动把模型输出的 [0,1] action 反归一化回原始 ee pose（pred*(max-min)+min）               │
+  ├─────────────────────────────────────────────────────────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────┤
+  │ InferenceResponse.model_info 新增                                                           │ 客户端可据此判断收到的 action 是否已反归一化                                             │
+  │ actions_denormalized、state_normalized、action_min、action_max                              │                                                                                          │
+  ├─────────────────────────────────────────────────────────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────┤
+  │ build_argparser 新增 --stats_path                                                           │ 命令行传入 stats.json 路径                                                               │
+  └─────────────────────────────────────────────────────────────────────────────────────────────┴──────────────────────────────────────────────────────────────────────────────────────────┘
+
+  2. franka/inference.sh
+
+  - TASK=place 自动指向 franka_data/place_objects_into_the_box_rc_0524/meta/stats.json
+  - TASK=stack 自动指向 franka_data/stack_bowls_rc/meta/stats.json
+  - 也可通过环境变量 DEFAULT_STATS_PATH=... 覆盖
+  - 启动命令自动加上 --stats_path
+
+  行为变化
+
+  ┌──────────────────────────────┬────────────────────────┬───────────────────────────────────────────────────────────────────┐
+  │                              │         改之前         │                    改之后（传了 --stats_path）                    │
+  ├──────────────────────────────┼────────────────────────┼───────────────────────────────────────────────────────────────────┤
+  │ 客户端传 state/proprio_data  │ 必须自己归一化到 [0,1] │ 传原始 ee pose [x,y,z,roll,pitch,yaw,gripper] 即可                │
+  ├──────────────────────────────┼────────────────────────┼───────────────────────────────────────────────────────────────────┤
+  │ 服务器返回 predicted_actions │ [0,1] 归一化值         │ 原始 ee pose 尺度（x/y/z 米，roll/pitch/yaw 弧度，gripper [0,1]） │
+  ├──────────────────────────────┼────────────────────────┼───────────────────────────────────────────────────────────────────┤
+  │ 不传 --stats_path            │ —                      │ 行为和改之前完全一样（向后兼容）                                  │
+  └──────────────────────────────┴────────────────────────┴───────────────────────────────────────────────────────────────────┘
+
+  ---
+  需要把哪些文件/数据传到服务器
+  
+  必须传的
+
+  ┌──────────────────────┬──────────────────────────────────────────────────────────────────────────────────────────────────────┬───────────────────────────────────────────────────────────┐
+  │      文件/数据       │                                           路径（服务器上）                                           │                           说明                            │
+  ├──────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────┼───────────────────────────────────────────────────────────┤
+  │ 模型权重             │ motus_franka_checkpoints/checkpoints_wan_vlm_mask_franka/robotwin_wan_vlm_mask_stage2_franka/<step>/ │ 训练保存的 checkpoint 目录，--ckpt_dir 指向它             │
+  ├──────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────┼───────────────────────────────────────────────────────────┤
+  │ WAN 2.2 5B 模型      │ pretrained_models/Wan2.2-TI2V-5B/                                                                    │ 含 VAE、T5、DiT 权重                                      │
+  ├──────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────┼───────────────────────────────────────────────────────────┤
+  │ Qwen3-VL-2B-Instruct │ pretrained_models/Qwen3-VL-2B-Instruct/                                                              │ VLM 权重 + processor                                      │
+  ├──────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────┼───────────────────────────────────────────────────────────┤
+  │ config yaml          │ Motus_initial_franka/configs/robotwin_wan_vlm_mask_stage2_franka.yaml                                │ 模型结构配置                                              │
+  ├──────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────┼───────────────────────────────────────────────────────────┤
+  │ stats.json           │ franka_data/place_objects_into_the_box_rc_0524/meta/stats.json（或 stack_bowls_rc 对应的）           │ 本次新增，--stats_path 指向它，用于 state 归一化 / action │
+  │                      │                                                                                                      │  反归一化                                                 │
+  ├──────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────┼───────────────────────────────────────────────────────────┤
+  │ T5 embedding         │ Motus_initial_franka/franka/place_objects_instruction.pt（或 stack_bowls_instruction.pt）            │ 任务文本的 T5 编码，--default_t5_embeddings_path          │
+  ├──────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────┼───────────────────────────────────────────────────────────┤
+  │ 任务指令文本         │ Motus_initial_franka/franka/place_objects_instruction.txt（或 stack_bowls）                          │ --default_instruction_file，VLM 用的 prompt               │
+  ├──────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────┼───────────────────────────────────────────────────────────┤
+  │ 服务器代码           │ Motus_initial_franka/franka/server_vlm_mask.py + 整个 Motus_initial_franka/ 工程                     │ 依赖 models/、data/、utils/、bak/wan/ 等                  │
+  └──────────────────────┴──────────────────────────────────────────────────────────────────────────────────────────────────────┴───────────────────────────────────────────────────────────┘
+
+  不需要传的（客户端本地有就行）
+
+  - 客户端不需要 stats.json（归一化/反归一化都在服务器做）
+  - 客户端不需要 T5 embedding、模型权重、config（都在服务器）
+
+  客户端每次请求只传
+
+  {
+      "images": [global_b64, wrist_b64, right_b64],   # 3 路 RGB 图 base64，顺序固定
+      "proprio_data": [[x,y,z,roll,pitch,yaw,gripper]],  # 原始 ee pose，最后一个作为当前 state
+      # 以下两项服务器启动时已配好 default，可不传
+      # "instruction": "place objects into the box",
+      # "t5_embeddings_path": "/path/to/place_objects_instruction.pt",
+  }
+
+  返回：
+  {
+      "predicted_actions": [[x,y,z,roll,pitch,yaw,gripper], ... x16],  # 原始尺度，16 步
+      "action_shape": [16, 7],
+      "model_info": {
+          "actions_denormalized": true,    # ← 表示已反归一化
+          "state_normalized": true,        # ← 表示 state 已被服务器归一化
+          "action_min": [...], "action_max": [...],
+          ...
+      }   
+  }   
+  
+  ---
+  启动命令（服务器侧）
+
+  cd /home/ma-user/work/wx1513998/Motus_initial_franka
+
+  TASK=place \
+  CKPT_DIR=/home/ma-user/work/wx1513998/motus_franka_checkpoints/checkpoints_wan_vlm_mask_franka/robotwin_wan_vlm_mask_stage2_franka/<step> \
+  WAN_PATH=/home/ma-user/work/wx1513998/pretrained_models/Wan2.2-TI2V-5B \
+  VLM_PATH=/home/ma-user/work/wx1513998/pretrained_models/Qwen3-VL-2B-Instruct \
+  bash franka/inference.sh
+
+  inference.sh 会自动把 --stats_path 指向对应任务的 stats.json。启动日志里会打印：
+
+  Loaded normalization stats from .../stats.json: action_min=[...], action_max=[...], ...
+
+  如果看到这行，说明归一化已生效，客户端直接传/收原始 ee pose 即可。
