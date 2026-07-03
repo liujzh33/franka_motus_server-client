@@ -19,10 +19,12 @@ case "$TASK" in
   place)
     DEFAULT_INSTRUCTION_FILE_DEFAULT="$ROOT_DIR/franka/place_objects_instruction.txt"
     DEFAULT_T5_EMBEDDINGS_PATH_DEFAULT="$ROOT_DIR/franka/place_objects_instruction.pt"
+    DEFAULT_STATS_PATH_DEFAULT="/home/ma-user/work/wx1513998/franka_data/place_objects_into_the_box_rc_0524/meta/stats.json"
     ;;
   stack)
     DEFAULT_INSTRUCTION_FILE_DEFAULT="$ROOT_DIR/franka/stack_bowls_instruction.txt"
     DEFAULT_T5_EMBEDDINGS_PATH_DEFAULT="$ROOT_DIR/franka/stack_bowls_instruction.pt"
+    DEFAULT_STATS_PATH_DEFAULT="/home/ma-user/work/wx1513998/franka_data/stack_bowls_rc/meta/stats.json"
     ;;
   *)
     echo "Unsupported TASK='$TASK'. Use TASK=place or TASK=stack." >&2
@@ -32,6 +34,7 @@ esac
 
 DEFAULT_INSTRUCTION_FILE="${DEFAULT_INSTRUCTION_FILE:-$DEFAULT_INSTRUCTION_FILE_DEFAULT}"
 DEFAULT_T5_EMBEDDINGS_PATH="${DEFAULT_T5_EMBEDDINGS_PATH:-$DEFAULT_T5_EMBEDDINGS_PATH_DEFAULT}"
+DEFAULT_STATS_PATH="${DEFAULT_STATS_PATH:-$DEFAULT_STATS_PATH_DEFAULT}"
 
 : "${CKPT_DIR:?Set CKPT_DIR to the Franka checkpoint directory before running this script.}"
 
@@ -61,6 +64,12 @@ if [[ ! -f "$DEFAULT_T5_EMBEDDINGS_PATH" && -z "$T5_EMBEDDINGS_DIR" ]]; then
   exit 1
 fi
 
+if [[ ! -f "$DEFAULT_STATS_PATH" ]]; then
+  echo "DEFAULT_STATS_PATH not found: $DEFAULT_STATS_PATH" >&2
+  echo "Provide the LeRobot v3.0 stats.json for state/action normalization." >&2
+  exit 1
+fi
+
 CMD=(
   python franka/server_vlm_mask.py
   --model_config "$MODEL_CONFIG"
@@ -82,6 +91,10 @@ fi
 
 if [[ -f "$DEFAULT_T5_EMBEDDINGS_PATH" ]]; then
   CMD+=(--default_t5_embeddings_path "$DEFAULT_T5_EMBEDDINGS_PATH")
+fi
+
+if [[ -f "$DEFAULT_STATS_PATH" ]]; then
+  CMD+=(--stats_path "$DEFAULT_STATS_PATH")
 fi
 
 echo "Launching Franka server with:"
