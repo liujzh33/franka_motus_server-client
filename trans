@@ -1,0 +1,51 @@
+ Dobot改不抖的方案                                                                               
+                                                                                                  
+    最简单有效的是加 action chunk temporal ensemble（ACT平滑），不需要改模型，只改推理端：        
+                                                                                                  
+    原理：                                                                                        
+    chunk1: [a0, a1, a2, a3, a4, a5, a7, a8, a9, a10, a11, a12, a13, a14, a15]                    
+    chunk2:                [b0, b1, b2, b3, b4, b5, b7, b8, b9, b10, b11, b12, b13, b14, b15]     
+    执行:                   ↑ 对a2和b0做加权平均                                                  
+                                                                                                  
+    改哪里：                                                                                      
+    1. dobot/server_vlm_mask.py — 推理返回16个action（已实现）                                    
+    2. dobot/client_ws.py或控制节点 — 加temporal ensemble：                                       
+      - 维护一个action buffer                                                                     
+      - 每次推理把16个action放入buffer                                                            
+      - 每个时间步取buffer中所有覆盖当前时刻的action做指数加权平均                                
+      - 权重：越早推理的chunk权重越低（weight = exp(-k * age)）                                   
+                                                                                                  
+    可以参考LeRobot的ACT推理代码，核心就一个函数：                                                
+                                                                                                  
+    class ActionChunkEnsembler:                                                                   
+        def __init__(self, action_dim, chunk_size=16, temperature=0.01):                          
+            self.chunk_size = chunk_size                                                          
+            self.temperature = temperature                                                        
+            self.buffer = []  # [(step_offset, actions[chunk_size, action_dim])]                  
+                                                                                                  
+        def add(self, actions):                                                                   
+            """添加一个chunk的action"""                                                           
+            self.buffer.append([0, actions.copy()])                                               
+            # 移除过期的                                                                          
+            self.buffer = [[s+1, a] for s, a in self.buffer if s+1 < self.chunk_size]             
+                                                                                                  
+        def get_action(self):                                                                     
+            """获取当前时刻的平滑action"""                                                        
+            if not self.buffer:                                                                   
+                return None                                                                       
+            weights = []                                                                          
+            actions = []                                                                          
+            for step, act in self.buffer:                                                         
+                # step=0是最新的chunk, step越大越旧                                               
+                w = np.exp(-step / max(self.temperature, 1e-4))                                   
+                weights.append(w)                                                                 
+                actions.append(act[step])  # 取每个chunk的第step个action                          
+            weights = np.array(weights)                                                           
+                # step=0是最新的chunk, step越大越旧                                               
+                w = np.exp(-step / max(self.temperature, 1e-4))                                   
+                weights.append(w)                                                                 
+                actions.append(act[step])  # 取每个chunk的第step个action                          
+            weights = np.array(weights)                                                           
+            weights /= weights.sum()                                                              
+            actions = np.array(actions)                                                           
+            return (actions * weights[:, None]).sum(axis=0)   
