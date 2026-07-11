@@ -1,0 +1,1 @@
+The whole scene is in a realistic, indoor environment with three camera views: a fixed top camera, a movable left arm wrist camera, and a movable right arm wrist camera. The Franka robot is currently performing the following task: place all the objects on the desk into the white basket
