@@ -1,0 +1,136 @@
+
+● place_objects_instruction.pt 是什么
+
+  这是一个 T5 语言嵌入（language embeddings）预计算文件，是给 Wan2.2 视频生成模型用的文本条件输入。
+
+  具体说明
+  
+  内容：一个 torch.Tensor，shape = [62, 4096]，dtype = bfloat16
+
+  - 62 = token 序列长度（对应文本 prompt 分词后的 token 数）
+  - 4096 = T5 文本编码器的隐层维度（Wan2.2 使用的是 T5-XXL，hidden_size=4096）
+
+  对应的文本（place_objects_instruction.txt）：
+
+  ▎ The whole scene is in a realistic, indoor environment with three camera views: a fixed top camera, a movable left arm wrist camera, and a movable right arm wrist camera. The Franka robot is 
+  ▎ currently performing the following task: place all the objects on the desk into the white basket
+
+  作用
+
+  在推理时，server_vlm_mask.py 通过 load_t5_embeddings() 加载这个 .pt 文件，把它作为语言条件输入到 Wan2.2 模型中，指导视频/动作生成。
+
+  为什么预计算：T5-XXL 编码器很大，每次推理都跑一遍文本编码很慢。所以提前把文本跑一次 T5，把 embedding 存成 .pt，推理时直接加载，省去重复编码。
+
+  使用流程
+
+  inference.sh
+    → 指定 --default_t5_embeddings_path place_objects_instruction.pt
+    → 指定 --default_instruction_file place_objects_instruction.txt
+    → server_vlm_mask.py 启动时加载 .pt 到内存
+    → 每次 inference request 直接用这个 embedding 作为 language condition
+
+  resolve_language_embeddings() 的查找优先级：
+  1. 请求里显式传 t5_embeddings_path
+  2. 根据 instruction 文本 MD5 自动查找 t5_embeddings_dir/{hash}.pt
+  3. 回退到 default_t5_embeddings_path（就是这个文件）
+  4. 都没有就报错
+  
+  同类文件
+
+  同目录下还有 stack_bowls_instruction.pt（shape 应该也是 [N, 4096]），对应 "stack three bowls together" 任务。
+
+✻ Cooked for 22s
+
+❯ 这是是使用什么方式计算出来的                                                                                                                                                                      
+
+  Thought for 10s (ctrl+o to expand)
+
+● Bash(# Search for scripts that generate/save T5 embeddings
+      cd /home/ma-user/work/wx1513998/Motus_initial_franka…)
+  ⎿  precompute_franka_t5.py
+     convert_robotwin_pi0_to_motus.py
+     t5_encode_multigpu.py
+     … +17 lines (ctrl+o to expand)
+     
+● Bash(# Search for T5 model loading / encoding in the codebase
+      cd /home/ma-user/work/wx1513998/Motus_initial_franka…)
+  ⎿  precompute_franka_t5.py
+     convert_robotwin_pi0_to_motus.py
+     t5_encode_multigpu.py
+     … +17 lines (ctrl+o to expand)
+
+  Read 1 file (ctrl+o to expand)
+
+● Bash(# Check the T5EncoderModel class to understand what model it uses
+      cd /home/ma-user/work/wx1513998/Motus_initial_franka…)
+  ⎿  /home/ma-user/work/wx1513998/Motus/bak/wan/modules/t5.py
+     /home/ma-user/work/wx1513998/Motus_initial_franka/bak/wan/modules/t5.py
+     /home/ma-user/work/wx1513998/RoboTwin_eval/policy/MotusWanVlmDirectMask/bak/wan/modules/t5.py
+     … +2 lines (ctrl+o to expand)
+
+  Read 1 file (ctrl+o to expand)
+
+● 计算方式
+
+  place_objects_instruction.pt 是用 Wan2.2 自带的 UMT5-XXL 文本编码器预计算出来的。
+
+  具体流程
+  
+  脚本：precompute_franka_t5.py
+
+  模型：umt5-xxl（阿里达摩院多语言 T5），只取 encoder 部分
+
+  ┌───────────────────┬────────────────────────────────────────────────┐
+  │       参数        │                       值                       │
+  ├───────────────────┼────────────────────────────────────────────────┤
+  │ 模型权重          │ Wan2.2-TI2V-5B/models_t5_umt5-xxl-enc-bf16.pth │
+  ├───────────────────┼────────────────────────────────────────────────┤
+  │ tokenizer         │ Wan2.2-TI2V-5B/google/umt5-xxl                 │
+  ├───────────────────┼────────────────────────────────────────────────┤
+  │ hidden_size (dim) │ 4096                                           │
+  ├───────────────────┼────────────────────────────────────────────────┤
+  │ 层数              │ 24 encoder layers                              │
+  ├───────────────────┼────────────────────────────────────────────────┤
+  │ attention heads   │ 64                                             │
+  ├───────────────────┼────────────────────────────────────────────────┤
+  │ FFN dim           │ 10240                                          │
+  ├───────────────────┼────────────────────────────────────────────────┤
+  │ vocab_size        │ 256384                                         │
+  ├───────────────────┼────────────────────────────────────────────────┤
+  │ dtype             │ bfloat16                                       │
+  ├───────────────────┼────────────────────────────────────────────────┤
+  │ text_len          │ 512（最大 token 长度）                         │
+  └───────────────────┴────────────────────────────────────────────────┘
+
+  计算步骤（precompute_franka_t5.py 第 99-108 行）：
+
+  # 1. 加载 UMT5-XXL encoder
+  encoder = T5EncoderModel(
+      text_len=512,
+      dtype=torch.bfloat16,
+      checkpoint_path=".../models_t5_umt5-xxl-enc-bf16.pth",
+      tokenizer_path=".../google/umt5-xxl",
+  )
+
+  # 2. 对任务文本进行编码
+  task = "The whole scene is in a realistic, indoor environment ..."
+  t5_out = encoder([task], device)   # tokenizer → token_embedding → 24层 encoder → LayerNorm
+
+  # 3. 去除 padding，只保留有效 token
+  #    encoder.__call__ 返回 [u[:v] for u, v in zip(context, seq_lens)]
+  #    即按实际 token 长度截断
+
+  # 4. 保存
+  emb = emb.squeeze(0)          # [62, 4096] — 62 是这段文本的实际 token 数
+  torch.save(emb.cpu(), "place_objects_instruction.pt")
+
+  关键细节
+
+  1. Tokenizer：用的是 HuggingfaceTokenizer，加载的是 google/umt5-xxl 分词器，clean='whitespace' 模式（做空白清洗）
+  2. 截断：输出按 mask 的实际有效长度截断，所以 [62, 4096] 中的 62 就是这段 instruction 文本被 UMT5 分词后的实际 token 数（不含 padding）
+  3. 只有 encoder：加载的是 encoder_only=True，不需要 decoder，因为只需要文本特征
+  4. bf16 精度：模型权重和计算都在 bfloat16 下进行，所以保存出来的 .pt 也是 bfloat16
+
+  为什么是 62 个 token
+
+  那段 instruction 文本（place_objects_instruction.txt 里约 200 个英文单词）经 UMT5-XXL 分词器切分后得到 62 个 token，每个 token 对应一个 4096 维的向量，最终 shape 就是 [62, 4096]。
